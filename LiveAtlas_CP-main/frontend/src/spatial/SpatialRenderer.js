@@ -1,0 +1,1412 @@
+// frontend/src/spatial/SpatialRenderer.js
+
+export class SpatialRenderer {
+  constructor() {
+    this.canvas = null;
+    this.gl = null;
+
+    this.renderMode = "spatial";
+
+    this.sceneCanvas = null;
+    this.sceneTexture = null;
+    this.videoSource = null;
+    this.lastVideoTime = -1;
+
+
+
+    this.depthEngine = null;
+    this.depthCanvas = null;
+    this.depthDisplacedVertices = null;
+    this.depthPreviousVertices = null;
+
+    this.program = null;
+    this.positionBuffer = null;
+    this.uvBuffer = null;
+    this.baseVertices = null;
+    this.baseUVs = null;
+    this.vertexCount = 0;
+
+    this.positionLocation = null;
+    this.uvLocation = null;
+
+    this.projectionLocation = null;
+    this.viewLocation = null;
+    this.modelLocation = null;
+    this.textureLocation = null;
+
+    this.width = 0;
+    this.height = 0;
+
+    this.debug = true;
+    this.parallaxOrigin = null;
+  }
+
+  initialize(canvas) {
+    if (!canvas) {
+      console.warn("[Spatial] Canvas not provided");
+      return false;
+    }
+
+    this.canvas = canvas;
+
+    this.gl = canvas.getContext("webgl", {
+      xrCompatible: true,
+      alpha: false,
+      antialias: false,
+      depth: true,
+      stencil: false,
+    });
+
+    if (!this.gl) {
+      console.error("[Spatial] WebGL unavailable");
+      return false;
+    }
+
+    const gl = this.gl;
+
+    const vertexShaderSource = `
+      attribute vec3 aPosition;
+      attribute vec2 aUV;
+
+      uniform mat4 uProjection;
+      uniform mat4 uView;
+      uniform mat4 uModel;
+
+      varying vec2 vUV;
+
+      void main() {
+        vUV = aUV;
+
+        gl_Position =
+          uProjection *
+          uView *
+          uModel *
+          vec4(aPosition, 1.0);
+      }
+    `;
+
+    const fragmentShaderSource = `
+      precision mediump float;
+
+      uniform sampler2D uTexture;
+
+      varying vec2 vUV;
+
+      void main() {
+        gl_FragColor = texture2D(uTexture, vUV);
+      }
+    `;
+
+    const vertexShader = this.createShader(
+      gl.VERTEX_SHADER,
+      vertexShaderSource,
+    );
+
+    const fragmentShader = this.createShader(
+      gl.FRAGMENT_SHADER,
+      fragmentShaderSource,
+    );
+
+    if (!vertexShader || !fragmentShader) {
+      return false;
+    }
+
+    this.program = this.createProgram(vertexShader, fragmentShader);
+
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+
+    if (!this.program) {
+      return false;
+    }
+
+    this.positionLocation = gl.getAttribLocation(
+      this.program,
+      "aPosition",
+    );
+
+    this.uvLocation = gl.getAttribLocation(
+      this.program,
+      "aUV",
+    );
+
+    this.projectionLocation = gl.getUniformLocation(
+      this.program,
+      "uProjection",
+    );
+
+    this.viewLocation = gl.getUniformLocation(
+      this.program,
+      "uView",
+    );
+
+    this.modelLocation = gl.getUniformLocation(
+      this.program,
+      "uModel",
+    );
+
+    this.textureLocation = gl.getUniformLocation(
+      this.program,
+      "uTexture",
+    );
+
+    const surfaceData =
+      this.renderMode === "360"
+        ? this.create360Sphere()
+        : this.createSpatialSurface();
+
+    this.baseVertices = surfaceData.vertices;
+    this.baseUVs = surfaceData.uvs;
+
+    this.positionBuffer = gl.createBuffer();
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      this.baseVertices,
+      gl.DYNAMIC_DRAW,
+    );
+
+    this.uvBuffer = gl.createBuffer();
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.uvBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      this.baseUVs,
+      gl.STATIC_DRAW,
+    );
+
+    this.vertexCount = this.baseVertices.length / 3;
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LESS);
+    gl.disable(gl.CULL_FACE);
+
+    if (this.videoSource) {
+      this.createVideoTexture();
+    }
+
+    console.log("[Spatial] WebGL spatial renderer initialized");
+
+    return true;
+  }
+
+  createSpatialSurface(rows = 40, columns = 160) {
+    const vertices = [];
+    const uvs = [];
+
+    const width = 12.8;
+    const height = 7.0;
+    const centerY = 1.6;
+    const centerZ = -2.5;
+
+    for (let row = 0; row <= rows; row += 1) {
+      const v = row / rows;
+      const verticalCurveRadius = 8.0;
+      const verticalCurveAngle =
+        (v - 0.5) * (height / verticalCurveRadius);
+
+      const y =
+        centerY +
+        Math.sin(verticalCurveAngle) * verticalCurveRadius;
+
+      for (let column = 0; column <= columns; column += 1) {
+        const u = column / columns;
+
+        const curveRadius = 5.0;
+        const curveAngle =
+          (u - 0.5) * (width / curveRadius);
+
+        const x =
+          Math.sin(curveAngle) * curveRadius;
+
+        const z =
+          centerZ +
+          Math.cos(curveAngle) * curveRadius -
+          curveRadius;
+
+        vertices.push(
+          x,
+          y,
+          z,
+        );
+
+        uvs.push(
+          u,
+          v
+        );
+      }
+    }
+
+    const indexedVertices = [];
+    const indexedUVs = [];
+
+    for (let row = 0; row < rows; row += 1) {
+      for (let column = 0; column < columns; column += 1) {
+        const topLeft =
+          row * (columns + 1) + column;
+
+        const topRight = topLeft + 1;
+
+        const bottomLeft =
+          (row + 1) * (columns + 1) + column;
+
+        const bottomRight = bottomLeft + 1;
+
+        indexedVertices.push(
+          vertices[topLeft * 3],
+          vertices[topLeft * 3 + 1],
+          vertices[topLeft * 3 + 2],
+
+          vertices[bottomLeft * 3],
+          vertices[bottomLeft * 3 + 1],
+          vertices[bottomLeft * 3 + 2],
+
+          vertices[topRight * 3],
+          vertices[topRight * 3 + 1],
+          vertices[topRight * 3 + 2],
+
+          vertices[topRight * 3],
+          vertices[topRight * 3 + 1],
+          vertices[topRight * 3 + 2],
+
+          vertices[bottomLeft * 3],
+          vertices[bottomLeft * 3 + 1],
+          vertices[bottomLeft * 3 + 2],
+
+          vertices[bottomRight * 3],
+          vertices[bottomRight * 3 + 1],
+          vertices[bottomRight * 3 + 2],
+        );
+
+        indexedUVs.push(
+          uvs[topLeft * 2],
+          uvs[topLeft * 2 + 1],
+
+          uvs[bottomLeft * 2],
+          uvs[bottomLeft * 2 + 1],
+
+          uvs[topRight * 2],
+          uvs[topRight * 2 + 1],
+
+          uvs[topRight * 2],
+          uvs[topRight * 2 + 1],
+
+          uvs[bottomLeft * 2],
+          uvs[bottomLeft * 2 + 1],
+
+          uvs[bottomRight * 2],
+          uvs[bottomRight * 2 + 1],
+        );
+      }
+    }
+
+    return {
+      vertices: new Float32Array(indexedVertices),
+      uvs: new Float32Array(indexedUVs),
+    };
+  }
+
+
+  create360Sphere(rows = 60, columns = 120) {
+    const vertices = [];
+    const uvs = [];
+
+    const radius = 50;
+
+    // Create a complete sphere.
+    //
+    // v = 0 → top of sphere
+    // v = 1 → bottom of sphere
+    //
+    // u = 0 → beginning of panorama
+    // u = 1 → end of panorama
+
+    for (let row = 0; row <= rows; row += 1) {
+      const v = row / rows;
+
+      // Latitude
+      const phi =
+        Math.PI / 2 -
+        v * Math.PI;
+
+      const cosPhi = Math.cos(phi);
+      const sinPhi = Math.sin(phi);
+
+      for (let column = 0; column <= columns; column += 1) {
+        const u = column / columns;
+
+        // Longitude
+        const theta =
+          u * Math.PI * 2;
+
+        const sinTheta = Math.sin(theta);
+        const cosTheta = Math.cos(theta);
+
+        const x =
+          radius *
+          cosPhi *
+          sinTheta;
+
+        const y =
+          radius *
+          sinPhi;
+
+        const z =
+          radius *
+          cosPhi *
+          cosTheta;
+
+        vertices.push(
+          x,
+          y,
+          z
+        );
+
+        // Equirectangular UV coordinates.
+        uvs.push(
+          u,
+          v
+        );
+      }
+    }
+
+    const indexedVertices = [];
+    const indexedUVs = [];
+
+    for (let row = 0; row < rows; row += 1) {
+      for (
+        let column = 0;
+        column < columns;
+        column += 1
+      ) {
+        const topLeft =
+          row * (columns + 1) +
+          column;
+
+        const topRight =
+          topLeft + 1;
+
+        const bottomLeft =
+          (row + 1) *
+          (columns + 1) +
+          column;
+
+        const bottomRight =
+          bottomLeft + 1;
+
+        // Triangle 1
+        indexedVertices.push(
+          vertices[topLeft * 3],
+          vertices[topLeft * 3 + 1],
+          vertices[topLeft * 3 + 2],
+
+          vertices[bottomLeft * 3],
+          vertices[bottomLeft * 3 + 1],
+          vertices[bottomLeft * 3 + 2],
+
+          vertices[topRight * 3],
+          vertices[topRight * 3 + 1],
+          vertices[topRight * 3 + 2]
+        );
+
+        indexedUVs.push(
+          uvs[topLeft * 2],
+          uvs[topLeft * 2 + 1],
+
+          uvs[bottomLeft * 2],
+          uvs[bottomLeft * 2 + 1],
+
+          uvs[topRight * 2],
+          uvs[topRight * 2 + 1]
+        );
+
+        // Triangle 2
+        indexedVertices.push(
+          vertices[topRight * 3],
+          vertices[topRight * 3 + 1],
+          vertices[topRight * 3 + 2],
+
+          vertices[bottomLeft * 3],
+          vertices[bottomLeft * 3 + 1],
+          vertices[bottomLeft * 3 + 2],
+
+          vertices[bottomRight * 3],
+          vertices[bottomRight * 3 + 1],
+          vertices[bottomRight * 3 + 2]
+        );
+
+        indexedUVs.push(
+          uvs[topRight * 2],
+          uvs[topRight * 2 + 1],
+
+          uvs[bottomLeft * 2],
+          uvs[bottomLeft * 2 + 1],
+
+          uvs[bottomRight * 2],
+          uvs[bottomRight * 2 + 1]
+        );
+      }
+    }
+
+    return {
+      vertices:
+        new Float32Array(indexedVertices),
+
+      uvs:
+        new Float32Array(indexedUVs)
+    };
+  }
+
+  setRenderMode(mode) {
+    if (
+      mode !== "spatial" &&
+      mode !== "360"
+    ) {
+      console.warn(
+        "[Spatial] Invalid render mode:",
+        mode
+      );
+
+      return false;
+    }
+
+    this.renderMode = mode;
+
+    console.log(
+      "[Spatial] Render mode changed:",
+      mode
+    );
+
+    if (!this.gl) {
+      return true;
+    }
+
+    const surfaceData =
+      mode === "360"
+        ? this.create360Sphere()
+        : this.createSpatialSurface();
+
+    this.baseVertices =
+      surfaceData.vertices;
+
+    this.baseUVs =
+      surfaceData.uvs;
+
+    this.depthDisplacedVertices = null;
+    this.depthPreviousVertices = null;
+
+    this.gl.bindBuffer(
+      this.gl.ARRAY_BUFFER,
+      this.positionBuffer
+    );
+
+    this.gl.bufferData(
+      this.gl.ARRAY_BUFFER,
+      this.baseVertices,
+      this.gl.DYNAMIC_DRAW
+    );
+
+    this.gl.bindBuffer(
+      this.gl.ARRAY_BUFFER,
+      this.uvBuffer
+    );
+
+    this.gl.bufferData(
+      this.gl.ARRAY_BUFFER,
+      this.baseUVs,
+      this.gl.STATIC_DRAW
+    );
+
+    this.vertexCount =
+      this.baseVertices.length / 3;
+
+    this.gl.bindBuffer(
+      this.gl.ARRAY_BUFFER,
+      null
+    );
+
+    return true;
+  }
+
+  createShader(type, source) {
+    const gl = this.gl;
+
+    const shader = gl.createShader(type);
+
+    if (!shader) {
+      return null;
+    }
+
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      console.error(
+        "[Spatial] Shader error:",
+        gl.getShaderInfoLog(shader),
+      );
+
+      gl.deleteShader(shader);
+
+      return null;
+    }
+
+    return shader;
+  }
+
+  createProgram(vertexShader, fragmentShader) {
+    const gl = this.gl;
+
+    const program = gl.createProgram();
+
+    if (!program) {
+      return null;
+    }
+
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error(
+        "[Spatial] Program error:",
+        gl.getProgramInfoLog(program),
+      );
+
+      gl.deleteProgram(program);
+
+      return null;
+    }
+
+    return program;
+  }
+
+  setSceneCanvas(sceneCanvas) {
+    this.sceneCanvas = sceneCanvas;
+
+    if (!this.gl || !sceneCanvas) {
+      return false;
+    }
+
+    const gl = this.gl;
+
+    if (this.sceneTexture) {
+      gl.deleteTexture(this.sceneTexture);
+    }
+
+    this.sceneTexture = gl.createTexture();
+
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      this.sceneTexture,
+    );
+
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_WRAP_S,
+      gl.CLAMP_TO_EDGE,
+    );
+
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_WRAP_T,
+      gl.CLAMP_TO_EDGE,
+    );
+
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_MIN_FILTER,
+      gl.LINEAR,
+    );
+
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_MAG_FILTER,
+      gl.LINEAR,
+    );
+
+    gl.pixelStorei(
+      gl.UNPACK_FLIP_Y_WEBGL,
+      true,
+    );
+
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      sceneCanvas,
+    );
+
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      null,
+    );
+
+    return true;
+  }
+
+  setDepthEngine(depthEngine) {
+    if (!depthEngine) {
+      console.warn("[Spatial] Invalid depth engine");
+      return false;
+    }
+
+    this.depthEngine = depthEngine;
+
+    console.log(
+      "[Spatial] Depth engine attached to renderer",
+    );
+
+    return true;
+  }
+
+  setVideoSource(video) {
+    if (!video) {
+      console.warn("[Spatial] Invalid video source");
+      return false;
+    }
+
+    this.videoSource = video;
+    this.lastVideoTime = -1;
+
+    if (!this.gl) {
+      console.log(
+        "[Spatial] WebGL not ready; video source stored",
+      );
+
+      return true;
+    }
+
+    this.createVideoTexture();
+
+    return true;
+  }
+
+  createVideoTexture() {
+    if (!this.gl || !this.videoSource) {
+      return false;
+    }
+
+    const gl = this.gl;
+
+    gl.pixelStorei(
+      gl.UNPACK_COLORSPACE_CONVERSION_WEBGL,
+      gl.NONE,
+    );
+
+    if (this.sceneTexture) {
+      gl.deleteTexture(this.sceneTexture);
+    }
+
+    this.sceneTexture = gl.createTexture();
+
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      this.sceneTexture,
+    );
+
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_WRAP_S,
+      gl.CLAMP_TO_EDGE,
+    );
+
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_WRAP_T,
+      gl.CLAMP_TO_EDGE,
+    );
+
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_MIN_FILTER,
+      gl.LINEAR,
+    );
+
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_MAG_FILTER,
+      gl.LINEAR,
+    );
+
+    gl.pixelStorei(
+      gl.UNPACK_FLIP_Y_WEBGL,
+      true,
+    );
+
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      null,
+    );
+
+    console.log(
+      "[Spatial] Real LiveAtlas video texture created",
+    );
+
+    return true;
+  }
+
+  updateVideoTexture() {
+    if (
+      !this.gl ||
+      !this.videoSource ||
+      !this.sceneTexture
+    ) {
+      return;
+    }
+
+    const video = this.videoSource;
+
+    if (
+      video.readyState <
+      HTMLMediaElement.HAVE_CURRENT_DATA
+    ) {
+      return;
+    }
+
+    if (
+      Number.isFinite(video.currentTime) &&
+      video.currentTime === this.lastVideoTime
+    ) {
+      return;
+    }
+
+    const gl = this.gl;
+
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      this.sceneTexture,
+    );
+
+    gl.pixelStorei(
+      gl.UNPACK_FLIP_Y_WEBGL,
+      true,
+    );
+
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      video,
+    );
+
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      null,
+    );
+
+    this.lastVideoTime = video.currentTime;
+  }
+
+  setDepthCanvas(depthCanvas) {
+    if (!depthCanvas) {
+      console.warn("[Spatial] Depth canvas missing");
+      return false;
+    }
+
+    this.depthCanvas = depthCanvas;
+    this.depthDisplacedVertices = null;
+    this.depthPreviousVertices = null;
+
+    console.log(
+      "[Spatial] Renderer depth canvas attached:",
+      `${depthCanvas.width}x${depthCanvas.height}`,
+    );
+
+    if (this.renderMode !== "360") {
+      requestAnimationFrame(() => {
+        this.applyDepthToGeometry();
+      });
+    }
+
+    return true;
+  }
+
+  applyDepthToGeometry() {
+    if (
+      this.renderMode === "360" ||
+      !this.gl ||
+      !this.depthCanvas ||
+      !this.positionBuffer ||
+      !this.baseVertices ||
+      !this.baseUVs
+    ) {
+      return;
+    }
+
+    const ctx = this.depthCanvas.getContext(
+      "2d",
+      {
+        willReadFrequently: true,
+      },
+    );
+
+    if (!ctx) {
+      return;
+    }
+
+    const imageData = ctx.getImageData(
+      0,
+      0,
+      this.depthCanvas.width,
+      this.depthCanvas.height,
+    );
+
+    const pixels = imageData.data;
+
+    const displacedVertices =
+      this.depthDisplacedVertices ||
+      new Float32Array(
+        this.baseVertices.length,
+      );
+
+
+    this.depthDisplacedVertices =
+      displacedVertices;
+
+
+    const previousVertices =
+      this.depthPreviousVertices;
+
+    const geometrySmoothing = 0.80;
+
+    const depthScale = 0.70;
+
+    const width = this.depthCanvas.width;
+    const height = this.depthCanvas.height;
+
+    for (
+      let i = 0;
+      i < this.baseVertices.length;
+      i += 3
+    ) {
+      const vertexIndex = i / 3;
+
+      const u =
+        this.baseUVs[vertexIndex * 2];
+
+      const v =
+        this.baseUVs[vertexIndex * 2 + 1];
+
+      const px = Math.max(
+        0,
+        Math.min(
+          width - 1,
+          Math.floor(u * width),
+        ),
+      );
+
+      const py = Math.max(
+        0,
+        Math.min(
+          height - 1,
+          Math.floor(v * height),
+        ),
+      );
+
+      const pixelIndex =
+        (py * width + px) * 4;
+
+      const rawDepth =
+        pixels[pixelIndex] / 255;
+
+      const centeredDepth =
+        (rawDepth - 0.5) * 1.6 + 0.5;
+
+      const depthBias =
+        0.03;
+
+      const clampedDepth =
+        Math.max(
+          0,
+          Math.min(
+            1,
+            centeredDepth + depthBias,
+          ),
+        );
+
+      const depth =
+        Math.pow(
+          clampedDepth,
+          0.65,
+        );
+
+      const depthOffset =
+        (depth - 0.5) * depthScale;
+
+      const baseX =
+        this.baseVertices[i];
+
+      const baseY =
+        this.baseVertices[i + 1];
+
+      const baseZ =
+        this.baseVertices[i + 2];
+
+      const curveRadius = 5.0;
+
+      const curveCenterZ =
+        -2.5 - curveRadius;
+
+      const radialX =
+        baseX;
+
+      const radialZ =
+        baseZ - curveCenterZ;
+
+      const radialLength =
+        Math.sqrt(
+          radialX * radialX +
+          radialZ * radialZ
+        );
+
+      const normalX =
+        radialLength > 0
+          ? radialX / radialLength
+          : 0;
+
+      const normalZ =
+        radialLength > 0
+          ? radialZ / radialLength
+          : 1;
+
+      displacedVertices[i] =
+        baseX +
+        normalX * depthOffset;
+
+      displacedVertices[i + 1] =
+        baseY;
+
+      const targetX =
+        baseX +
+        normalX * depthOffset;
+
+      const targetY =
+        baseY;
+
+      const targetZ =
+        baseZ +
+        normalZ * depthOffset;
+
+      if (previousVertices) {
+        displacedVertices[i] =
+          previousVertices[i] *
+          geometrySmoothing +
+          targetX *
+          (1 - geometrySmoothing);
+
+        displacedVertices[i + 1] =
+          previousVertices[i + 1] *
+          geometrySmoothing +
+          targetY *
+          (1 - geometrySmoothing);
+
+        displacedVertices[i + 2] =
+          previousVertices[i + 2] *
+          geometrySmoothing +
+          targetZ *
+          (1 - geometrySmoothing);
+      } else {
+        displacedVertices[i] =
+          targetX;
+
+        displacedVertices[i + 1] =
+          targetY;
+
+        displacedVertices[i + 2] =
+          targetZ;
+      }
+    }
+
+    if (!this.depthPreviousVertices) {
+      this.depthPreviousVertices =
+        new Float32Array(
+          displacedVertices.length,
+        );
+    }
+
+    this.depthPreviousVertices.set(
+      displacedVertices,
+    );
+
+    this.depthDisplacedVertices =
+      displacedVertices;
+
+    const gl = this.gl;
+
+    gl.bindBuffer(
+      gl.ARRAY_BUFFER,
+      this.positionBuffer,
+    );
+
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      displacedVertices,
+      gl.DYNAMIC_DRAW,
+    );
+
+    gl.bindBuffer(
+      gl.ARRAY_BUFFER,
+      null,
+    );
+
+    console.log(
+      "[Spatial] AI depth geometry generated",
+    );
+  }
+
+  async setupXR(session) {
+    if (!this.gl) {
+      console.error(
+        "[Spatial] WebGL context missing",
+      );
+
+      return false;
+    }
+
+    await this.gl.makeXRCompatible();
+
+    const glLayer = new XRWebGLLayer(
+      session,
+      this.gl,
+      {
+        alpha: false,
+        antialias: false,
+        depth: true,
+        stencil: false,
+      },
+    );
+
+    session.updateRenderState({
+      baseLayer: glLayer,
+    });
+
+    this.xrSession = session;
+    this.xrReferenceSpace =
+      await session.requestReferenceSpace("local-floor");
+
+    this.parallaxOrigin = null;
+
+    this.xrSession.addEventListener("end", () => {
+      this.xrSession = null;
+      this.xrReferenceSpace = null;
+    });
+
+    console.log(
+      "[Spatial] XRWebGLLayer configured",
+    );
+
+    return true;
+  }
+
+  renderXR(frame, referenceSpace) {
+    if (!this.gl) {
+      return;
+    }
+
+    const session = frame.session;
+
+    if (
+      !this.xrSession ||
+      this.xrSession !== session
+    ) {
+      return;
+    }
+
+    const pose =
+      frame.getViewerPose(
+        referenceSpace,
+      );
+
+    if (!pose) {
+      return;
+    }
+
+
+
+    if (!this.parallaxOrigin) {
+      this.parallaxOrigin = {
+        x: pose.transform.position.x,
+        y: pose.transform.position.y,
+        z: pose.transform.position.z,
+      };
+    }
+
+    const layer =
+      session.renderState.baseLayer;
+
+    if (!layer) {
+      return;
+    }
+
+    const gl = this.gl;
+
+    gl.bindFramebuffer(
+      gl.FRAMEBUFFER,
+      layer.framebuffer,
+    );
+
+    gl.enable(gl.DEPTH_TEST);
+
+    gl.clearColor(
+      0,
+      0,
+      0,
+      1,
+    );
+
+    gl.clear(
+      gl.COLOR_BUFFER_BIT |
+      gl.DEPTH_BUFFER_BIT,
+    );
+
+    this.updateVideoTexture();
+
+    for (const view of pose.views) {
+      const viewport = layer.getViewport(view);
+      if (!viewport) continue;
+
+      gl.viewport(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        viewport.height,
+      );
+
+      this.drawSpatialSurface(
+        view.projectionMatrix,
+        view.transform.inverse.matrix,
+        {
+          x: view.transform.position.x - this.parallaxOrigin.x,
+          y: view.transform.position.y - this.parallaxOrigin.y,
+          z: view.transform.position.z - this.parallaxOrigin.z,
+        },
+      );
+    }
+  }
+
+  drawSpatialSurface(
+    projectionMatrix,
+    viewMatrix,
+    viewPosition,
+  ) {
+    const gl = this.gl;
+
+    if (
+      !gl ||
+      !this.program ||
+      !this.sceneTexture ||
+      !this.positionBuffer ||
+      !this.uvBuffer
+    ) {
+      return;
+    }
+
+    gl.useProgram(this.program);
+
+    gl.bindBuffer(
+      gl.ARRAY_BUFFER,
+      this.positionBuffer,
+    );
+
+    gl.enableVertexAttribArray(
+      this.positionLocation,
+    );
+
+    gl.vertexAttribPointer(
+      this.positionLocation,
+      3,
+      gl.FLOAT,
+      false,
+      0,
+      0,
+    );
+
+    gl.bindBuffer(
+      gl.ARRAY_BUFFER,
+      this.uvBuffer,
+    );
+
+    gl.enableVertexAttribArray(
+      this.uvLocation,
+    );
+
+    gl.vertexAttribPointer(
+      this.uvLocation,
+      2,
+      gl.FLOAT,
+      false,
+      0,
+      0,
+    );
+
+    const modelMatrix =
+      new Float32Array([
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+      ]);
+
+    gl.uniformMatrix4fv(
+      this.projectionLocation,
+      false,
+      projectionMatrix,
+    );
+
+    gl.uniformMatrix4fv(
+      this.viewLocation,
+      false,
+      viewMatrix,
+    );
+
+    gl.uniformMatrix4fv(
+      this.modelLocation,
+      false,
+      modelMatrix,
+    );
+
+    gl.activeTexture(
+      gl.TEXTURE0,
+    );
+
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      this.sceneTexture,
+    );
+
+    gl.uniform1i(
+      this.textureLocation,
+      0,
+    );
+
+    gl.drawArrays(
+      gl.TRIANGLES,
+      0,
+      this.vertexCount,
+    );
+
+    gl.bindTexture(
+      gl.TEXTURE_2D,
+      null,
+    );
+  }
+
+  render() {
+    if (!this.gl) {
+      return;
+    }
+
+    const gl = this.gl;
+
+    gl.bindFramebuffer(
+      gl.FRAMEBUFFER,
+      null,
+    );
+
+    gl.viewport(
+      0,
+      0,
+      this.canvas.width,
+      this.canvas.height,
+    );
+
+    gl.clearColor(
+      0.03,
+      0.03,
+      0.03,
+      1,
+    );
+
+    gl.clear(
+      gl.COLOR_BUFFER_BIT |
+      gl.DEPTH_BUFFER_BIT,
+    );
+  }
+
+  resize() {
+    if (!this.canvas) {
+      return;
+    }
+
+    this.width =
+      window.innerWidth;
+
+    this.height =
+      window.innerHeight;
+
+    this.canvas.width =
+      this.width;
+
+    this.canvas.height =
+      this.height;
+  }
+
+  destroy() {
+    if (!this.gl) {
+      return;
+    }
+
+    const gl = this.gl;
+
+    if (this.sceneTexture) {
+      gl.deleteTexture(
+        this.sceneTexture,
+      );
+    }
+
+    if (this.positionBuffer) {
+      gl.deleteBuffer(
+        this.positionBuffer,
+      );
+    }
+
+    if (this.uvBuffer) {
+      gl.deleteBuffer(
+        this.uvBuffer,
+      );
+    }
+
+    if (this.program) {
+      gl.deleteProgram(
+        this.program,
+      );
+    }
+
+    this.canvas = null;
+    this.gl = null;
+    this.program = null;
+
+    this.positionBuffer = null;
+    this.uvBuffer = null;
+
+    this.sceneTexture = null;
+    this.depthCanvas = null;
+    this.depthDisplacedVertices = null;
+    this.depthPreviousVertices = null;
+    this.videoSource = null;
+
+    this.baseVertices = null;
+    this.baseUVs = null;
+
+    this.vertexCount = 0;
+    this.lastVideoTime = -1;
+    this.parallaxOrigin = null;
+
+    this.xrSession = null;
+    this.xrReferenceSpace = null;
+
+    console.log(
+      "[Spatial] WebGL renderer destroyed",
+    );
+  }
+}
+
+export default SpatialRenderer;

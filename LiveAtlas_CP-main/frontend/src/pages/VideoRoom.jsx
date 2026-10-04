@@ -1,0 +1,1825 @@
+import React, { useEffect, useRef, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import "./VideoRoom.css";
+import {
+  FaMicrophone,
+  FaMicrophoneSlash,
+  FaVideo,
+  FaVideoSlash,
+  FaPhoneSlash,
+  FaExpand,
+  FaCompress,
+  FaGlobeAmericas,
+  FaSyncAlt,
+} from "react-icons/fa";
+import { initVR, disposeVR } from "../vr/vrEngine";
+import { startImmersiveVR, stopImmersiveVR } from "../vr/immersiveVR";
+import { askAI } from "../ai/aiService";
+import { supabase } from "../lib/supabase";
+import { NetworkEngine } from "../network/networkEngine";
+import CommunicationStatus from "../Components/CommunicationStatus";
+import { BrowserController } from "../network/browserController";
+import SpatialRenderer from "../spatial/SpatialRenderer";
+import WebXRController from "../spatial/WebXRController";
+import DepthEngine from "../spatial/DepthEngine";
+import EquirectangularSynthesizer from "../spatial/EquirectangularSynthesizer";
+
+/* ─────────────────────────────────────────────────────────
+   QUALITY CONSTANTS  — tweak here for different networks
+───────────────────────────────────────────────────────── */
+const Q = {
+  // Video resolution
+  VIDEO_W_IDEAL: 1280,
+  VIDEO_W_MAX: 1280,
+  VIDEO_H_IDEAL: 720,
+  VIDEO_H_MAX: 720,
+  FRAMERATE_IDEAL: 30,
+  FRAMERATE_MAX: 30,
+
+  // Audio
+  AUDIO_SAMPLE_RATE: 48000,
+  AUDIO_CHANNELS: 2,
+
+  // Reconnect
+  RECONNECT_DELAY_MS: 800, // was 2000ms — much faster reconnect
+};
+
+function getVideoConstraints(facingMode) {
+  return {
+    width: { ideal: Q.VIDEO_W_IDEAL, max: Q.VIDEO_W_MAX },
+    height: { ideal: Q.VIDEO_H_IDEAL, max: Q.VIDEO_H_MAX },
+    frameRate: {
+      ideal: Q.FRAMERATE_IDEAL,
+      max: Q.FRAMERATE_MAX,
+    },
+    facingMode: { ideal: facingMode },
+  };
+}
+
+/* ─────────────────────────────────────────────────────────
+   CODEC PRIORITY HELPER
+   Forces H.264 > VP9 > VP8 order in SDP
+   H.264 hardware-encoded on phones = best quality + lowest CPU
+───────────────────────────────────────────────────────── */
+function preferHighQualityCodecs(sdp, kind) {
+  if (kind !== "video") return sdp;
+
+  const lines = sdp.split("\r\n");
+  const mLineIdx = lines.findIndex((l) => l.startsWith("m=video"));
+  if (mLineIdx === -1) return sdp;
+
+  // Collect all rtpmap lines
+  const rtpmaps = {};
+  lines.forEach((l) => {
+    const m = l.match(/^a=rtpmap:(\d+)\s+(\S+)/);
+    if (m) rtpmaps[m[1]] = m[2].toLowerCase();
+  });
+
+  // Priority order: H264 (hardware) → VP9 → AV1 → VP8
+  const priority = ["h264", "vp9", "av1", "vp8"];
+  const mLine = lines[mLineIdx].split(" ");
+  const header = mLine.slice(0, 3);
+  const payloads = mLine.slice(3);
+
+  const sorted = payloads.sort((a, b) => {
+    const nameA = rtpmaps[a] || "";
+    const nameB = rtpmaps[b] || "";
+    const idxA = priority.findIndex((p) => nameA.startsWith(p));
+    const idxB = priority.findIndex((p) => nameB.startsWith(p));
+    return (idxA === -1 ? 99 : idxA) - (idxB === -1 ? 99 : idxB);
+  });
+
+  lines[mLineIdx] = [...header, ...sorted].join(" ");
+  return lines.join("\r\n");
+}
+
+function inspectWebRTCFeedback(sdp, label) {
+  if (!sdp) {
+    console.log(`[WEBRTC SDP] ${label}: no SDP available`);
+    return;
+  }
+
+  const lines = sdp.split("\r\n");
+
+  const feedback = lines.filter(
+    (line) =>
+      line.startsWith("a=rtcp-fb:") &&
+      /nack|pli|fir|ccm|transport-cc/i.test(line),
+  );
+
+  const rtx = lines.filter(
+    (line) =>
+      line.startsWith("a=rtpmap:") &&
+      /\brtx\/\d+/i.test(line),
+  );
+
+  const fec = lines.filter(
+    (line) =>
+      line.startsWith("a=rtpmap:") &&
+      /\b(red|ulpfec|flexfec-\d+)\//i.test(line),
+  );
+
+  console.log(`[WEBRTC SDP] ${label}`, {
+    nack: feedback.filter((line) => /\bnack\b/i.test(line)),
+    rtx,
+    fec,
+    allVideoFeedback: feedback,
+  });
+}
+
+
+
+/* ═══════════════════════════════════════════════════════
+   MAIN COMPONENT — ALL ORIGINAL LOGIC PRESERVED
+═══════════════════════════════════════════════════════ */
+const VideoRoom = () => {
+  const spatialRendererRef = useRef(null);
+
+  const spatialXRRef = useRef(null);
+
+  const depthEngineRef = useRef(null);
+  const depthStartedRef = useRef(false);
+  const equirectSynthRef = useRef(null);
+
+
+
+
+  const { roomID } = useParams();
+  const navigate = useNavigate();
+
+  /* ── ORIGINAL STATE ── */
+  const [isAudioOn, setIsAudioOn] = useState(true);
+  const [isVideoOn, setIsVideoOn] = useState(true);
+  const [isFullScreen, setIsFullScreen] = useState(false);
+  const [communicationStatus, setCommunicationStatus] = useState({
+    connected: false,
+    quality: "Basic",
+    latency: "--",
+    video: "SD",
+
+    actualBitrate: 0,
+    availableBitrate: 0,
+
+    captureWidth: 0,
+    captureHeight: 0,
+
+    encodedWidth: 0,
+    encodedHeight: 0,
+
+    receivedWidth: 0,
+    receivedHeight: 0,
+  });
+  const [isVRMode, setIsVRMode] = useState(false);
+  const [isImmersiveVR, setIsImmersiveVR] = useState(false);
+  const [cameraFacing, setCameraFacing] = useState("environment");
+  const [connectionQuality, setConnectionQuality] = useState("good");
+  const [micLevel, setMicLevel] = useState(0);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [aiQuestion, setAIQuestion] = useState("");
+  const [aiAnswer, setAIAnswer] = useState("");
+  const [aiLoading, setAILoading] = useState(false);
+  const [guideLocation, setGuideLocation] = useState(null);
+  const [placeName, setPlaceName] = useState("");
+  const [selectedIntent, setSelectedIntent] = useState("Explore");
+  const [showControls, setShowControls] = useState(true);
+  const [showLocalVideo, setShowLocalVideo] = useState(true);
+
+  /* ── ORIGINAL REFS ── */
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const vrContainerRef = useRef(null);
+  const ws = useRef(null);
+  const peerConnection = useRef(null);
+  const pendingIceCandidatesRef = useRef([]);
+  const networkEngineRef = useRef(null);
+  const iceRestartTimerRef = useRef(null);
+  const communicationStatusTimerRef = useRef(null);
+  const browserControllerRef = useRef(null);
+  const badNetworkSinceRef = useRef(null);
+  const lastAutomaticIceRestartRef = useRef(0);
+
+  useEffect(() => {
+    if (!spatialRendererRef.current) {
+      spatialRendererRef.current = new SpatialRenderer();
+    }
+
+    if (!depthEngineRef.current) {
+      depthEngineRef.current = new DepthEngine();
+    }
+
+    if (!spatialXRRef.current) {
+      spatialXRRef.current = new WebXRController();
+
+      spatialXRRef.current.setRenderer(
+        spatialRendererRef.current);
+    }
+
+    spatialXRRef.current.setSessionEndedCallback(() => {
+      setIsImmersiveVR(false);
+      setShowControls(true);
+
+      if (spatialRendererRef.current?.canvas) {
+        spatialRendererRef.current.canvas.style.display = "none";
+      }
+
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.style.display = "";
+      }
+    });
+
+    console.log("[Spatial] Renderer + WebXR initialized");
+
+    return () => {
+      if (spatialXRRef.current) {
+        spatialXRRef.current.stopSession();
+      }
+
+      if (spatialRendererRef.current) {
+        spatialRendererRef.current.destroy();
+      }
+
+      if (depthEngineRef.current) {
+        depthEngineRef.current.destroy();
+      }
+
+      spatialXRRef.current = null;
+      spatialRendererRef.current = null;
+      depthEngineRef.current = null;
+    };
+  }, []);
+
+  /* ── ORIGINAL INTENT FETCH + REALTIME (unchanged) ── */
+  useEffect(() => {
+    async function fetchIntent() {
+      const { data } = await supabase
+        .from("session_intents")
+        .select("*")
+        .eq("room_id", roomID)
+        .order("id", { ascending: false })
+        .limit(1);
+
+      if (data && data.length > 0) {
+        setSelectedIntent(data[0].intent);
+        console.log("Fetched Intent:", data[0].intent);
+      } else {
+        setSelectedIntent("Explore");
+      }
+    }
+
+    fetchIntent();
+
+    const channel = supabase
+      .channel("intent-live")
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "session_intents",
+          filter: `room_id=eq.${roomID}`,
+        },
+        (payload) => {
+          console.log("Realtime Intent:", payload.new.intent);
+          setSelectedIntent(payload.new.intent);
+        },
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [roomID]);
+
+  /* ── ORIGINAL controls auto-hide (unchanged) ── */
+  useEffect(() => {
+    let timer;
+    if (isFullScreen && showControls) {
+      timer = setTimeout(() => setShowControls(false), 3000);
+    }
+    return () => clearTimeout(timer);
+  }, [isFullScreen, showControls]);
+
+  /* ── ORIGINAL INTENT EFFECT (unchanged) ── */
+  useEffect(() => {
+    console.log("Current Intent:", selectedIntent);
+    if (selectedIntent === "Explore") {
+      setIsVRMode(false);
+      console.log("🌍 Explore → Normal viewing mode");
+    }
+    if (selectedIntent === "Talk") {
+      setIsVRMode(false);
+      console.log("🗣 Talk → Interaction focused mode");
+    }
+    if (selectedIntent === "Learn") {
+      setIsVRMode(false);
+      if (!aiQuestion) {
+        setAIQuestion("Explain this place");
+        handleAskAI();
+      }
+      console.log("📘 Learn → AI auto explanation triggered");
+    }
+    if (selectedIntent === "Experience") {
+      setIsVRMode(true);
+      console.log("🎥 Experience → VR mode ON");
+    }
+  }, [selectedIntent]);
+
+  /* ── ORIGINAL switchCamera (unchanged) ── */
+  const switchCamera = async () => {
+    const newFacing = cameraFacing === "environment" ? "user" : "environment";
+    setCameraFacing(newFacing);
+    const oldStream = localVideoRef.current?.srcObject;
+    if (oldStream) oldStream.getVideoTracks().forEach((track) => track.stop());
+    try {
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: getVideoConstraints(newFacing),
+        audio: false,
+      });
+      const videoTrack = newStream.getVideoTracks()[0];
+      const sender = peerConnection.current
+        ?.getSenders()
+        .find((s) => s.track?.kind === "video");
+      if (sender) sender.replaceTrack(videoTrack);
+      const audioTracks = oldStream?.getAudioTracks() || [];
+      localVideoRef.current.srcObject = new MediaStream([
+        videoTrack,
+        ...audioTracks,
+      ]);
+    } catch (err) {
+      console.error("Camera switch failed:", err);
+    }
+  };
+
+  /* ── MAIN WebRTC EFFECT — signaling logic unchanged, quality upgraded ── */
+  useEffect(() => {
+    /* ORIGINAL geolocation (unchanged) */
+    navigator.geolocation.getCurrentPosition((position) => {
+      const latitude = position.coords.latitude;
+      const longitude = position.coords.longitude;
+      setGuideLocation({ lat: latitude, lon: longitude });
+      fetch(
+        `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json`,
+        {
+          headers: {
+            "User-Agent": "LiveAtlas/1.0 (https://liveatlas-cp-1.onrender.com)",
+          },
+        },
+      )
+        .then((res) => res.json())
+        .then((data) => {
+          if (data?.display_name) setPlaceName(data.display_name);
+        })
+        .catch((err) => console.error("Location API error:", err));
+      console.log("Guide location:", latitude, longitude);
+    });
+
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+
+    /* ORIGINAL connectWebSocket — only RECONNECT_DELAY_MS changed (800ms vs 2000ms) */
+    const connectWebSocket = () => {
+      const normalizedRoomID = roomID.replace("_", "-");
+
+      if (!navigator.onLine) {
+        console.warn("Offline: skipping WebSocket connection");
+        setIsReconnecting(true);
+        return;
+      }
+
+      // Prevent duplicate WebSocket connections
+      if (
+        ws.current &&
+        (ws.current.readyState === WebSocket.OPEN ||
+          ws.current.readyState === WebSocket.CONNECTING)
+      ) {
+        console.log("WebSocket already connected/connecting");
+        return;
+      }
+
+      setIsReconnecting(true);
+
+      const socket = new WebSocket(
+        `${protocol}://liveatlas-cp.onrender.com/ws/tours/${normalizedRoomID}/`,
+      );
+
+      // Make this socket the current active socket
+      ws.current = socket;
+
+      socket.onopen = async () => {
+        console.log("WebSocket connected");
+
+        // Ignore stale sockets
+        if (ws.current !== socket) return;
+
+        setIsReconnecting(false);
+
+        if (!peerConnection.current) {
+          await setupWebRTC();
+        }
+      };
+
+      socket.onclose = () => {
+        console.log("WebSocket disconnected");
+
+        // Ignore an old socket that has already been replaced
+        if (ws.current !== socket) return;
+
+        ws.current = null;
+        setIsReconnecting(true);
+
+        setTimeout(() => {
+          if (document.visibilityState === "visible" && !ws.current) {
+            console.log("Attempting WebSocket reconnect...");
+            connectWebSocket();
+          }
+        }, Q.RECONNECT_DELAY_MS);
+      };
+
+      socket.onerror = (error) => {
+        console.error("WebSocket error:", error);
+      };
+
+      socket.onmessage = async (event) => {
+        // Ignore messages from stale sockets
+        if (ws.current !== socket) return;
+
+        try {
+          const data = JSON.parse(event.data);
+          handleSignalMessage(data);
+        } catch (error) {
+          console.error("WebSocket message parsing error:", error);
+        }
+      };
+    };
+
+    if (!ws.current) connectWebSocket();
+
+    const handleVisibility = () => {
+      if (document.hidden) {
+        console.log("Tab hidden");
+      } else {
+        console.log("Tab active again — checking stream health");
+        if (!ws.current) {
+          console.log("Tab became visible - reconnecting");
+          connectWebSocket();
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      if (iceRestartTimerRef.current) {
+        clearTimeout(iceRestartTimerRef.current);
+        iceRestartTimerRef.current = null;
+      }
+      if (ws.current) {
+        ws.current.onclose = null;
+        ws.current.close();
+        ws.current = null;
+      }
+      if (localVideoRef.current?.srcObject) {
+        localVideoRef.current.srcObject.getTracks().forEach((t) => t.stop());
+      }
+      if (networkEngineRef.current) {
+        networkEngineRef.current.stop();
+      }
+
+      if (browserControllerRef.current) {
+        browserControllerRef.current.reset();
+        browserControllerRef.current = null;
+      }
+
+      if (communicationStatusTimerRef.current) {
+        clearInterval(communicationStatusTimerRef.current);
+        communicationStatusTimerRef.current = null;
+      }
+
+      if (peerConnection.current) {
+        peerConnection.current.close();
+      }
+
+      disposeVR();
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [roomID]);
+
+  /* ── ORIGINAL VR effect (unchanged) ── */
+  useEffect(() => {
+    console.log("VR Effect Triggered:", isVRMode);
+    const video = remoteVideoRef.current;
+    if (!video || !vrContainerRef.current) {
+      console.log("VR skipped: video or container missing");
+      return;
+    }
+    if (isVRMode) {
+      console.log("Starting VR...");
+      initVR(vrContainerRef.current, video);
+    } else {
+      console.log("Stopping VR...");
+      disposeVR();
+    }
+    return () => {
+      disposeVR();
+    };
+  }, [isVRMode]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let depthLoopTimer = null;
+
+    const runImmersiveVR = async () => {
+      const video = remoteVideoRef.current;
+
+      if (!isImmersiveVR) {
+        setShowControls(true);
+        depthStartedRef.current = false;
+
+        if (depthEngineRef.current) {
+          depthEngineRef.current.reset();
+        }
+
+        if (spatialXRRef.current) {
+          spatialXRRef.current.stopSession();
+        }
+
+        return;
+      }
+
+      if (!video || !vrContainerRef.current) {
+        console.log(
+          "[Spatial] Immersive VR skipped: video or container missing"
+        );
+        return;
+      }
+
+      // 360 mode currently uses a true spherical surface.
+      // AI depth deformation is intentionally disabled.
+
+
+
+      if (cancelled) return;
+
+      /*
+       * WebXR is confirmed active.
+       * Now create the renderer.
+       */
+      if (
+        spatialRendererRef.current &&
+        vrContainerRef.current
+      ) {
+        const renderer =
+          spatialRendererRef.current;
+
+        if (!renderer.canvas) {
+          const canvas =
+            document.createElement("canvas");
+
+          canvas.style.position = "absolute";
+          canvas.style.inset = "0";
+          canvas.style.width = "100%";
+          canvas.style.height = "100%";
+          canvas.style.zIndex = "1";
+
+          vrContainerRef.current.appendChild(canvas);
+
+          renderer.initialize(canvas);
+
+          console.log(
+            "[Spatial] Production WebGL renderer initialized"
+          );
+        } else if (
+          renderer.canvas.parentElement !==
+          vrContainerRef.current
+        ) {
+          vrContainerRef.current.appendChild(
+            renderer.canvas
+          );
+
+          console.log(
+            "[Spatial] Existing WebGL canvas reattached"
+          );
+        }
+
+        renderer.setRenderMode("360");
+        renderer.setVideoSource(video);
+
+        renderer.canvas.style.display = "block";
+        video.style.display = "none";
+      }
+
+
+      if (
+        spatialXRRef.current &&
+        !spatialXRRef.current.isActive()
+      ) {
+        const spatialStarted =
+          await spatialXRRef.current.startSession();
+
+        console.log(
+          "[Spatial] Real-video WebXR session:",
+          spatialStarted
+        );
+
+        if (!spatialStarted) {
+          console.warn(
+            "[Spatial] WebXR immersive-vr unavailable. Returning to normal video."
+          );
+
+          setIsImmersiveVR(false);
+          setShowControls(true);
+
+          if (spatialRendererRef.current?.canvas) {
+            spatialRendererRef.current.canvas.style.display = "none";
+          }
+
+          if (video) {
+            video.style.display = "";
+          }
+
+          return;
+        }
+      }
+
+      if (cancelled) return;
+
+
+      if (
+        false &&
+        !cancelled &&
+        depthEngineRef.current &&
+        !depthStartedRef.current
+      ) {
+
+        depthStartedRef.current = true;
+
+        const runDepth = async () => {
+          if (
+            cancelled ||
+            !depthEngineRef.current ||
+            !depthStartedRef.current
+          ) {
+            return;
+          }
+
+          let depthMap = null;
+
+          try {
+            depthMap =
+              depthEngineRef.current
+                ? await depthEngineRef.current.estimate(video)
+                : null;
+          } catch (error) {
+            if (!cancelled) {
+              console.error(
+                "[Spatial] Depth loop failed:",
+                error
+              );
+            }
+          }
+
+          if (
+            !cancelled &&
+            depthMap &&
+            depthMap.source &&
+            spatialRendererRef.current
+          ) {
+            spatialRendererRef.current.setDepthCanvas(
+              depthMap.source
+            );
+          }
+
+          if (
+            !cancelled &&
+            depthEngineRef.current &&
+            depthStartedRef.current
+          ) {
+            depthLoopTimer = setTimeout(runDepth, 5000);
+          }
+        };
+
+        runDepth();
+      }
+
+      setShowControls(false);
+
+      console.log(
+        "[Spatial] Immersive VR fully started"
+      );
+    };
+
+    runImmersiveVR();
+
+    return () => {
+      cancelled = true;
+
+      if (depthLoopTimer) {
+        clearTimeout(depthLoopTimer);
+        depthLoopTimer = null;
+      }
+
+      if (depthEngineRef.current) {
+        depthEngineRef.current.reset();
+      }
+
+      if (spatialXRRef.current) {
+        spatialXRRef.current.stopSession();
+      }
+    };
+  }, [isImmersiveVR]);
+
+
+  const get360CameraStream = async () => {
+    const permissionStream =
+      await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false,
+      });
+
+    permissionStream
+      .getVideoTracks()
+      .forEach((track) => track.stop());
+
+    const devices =
+      await navigator.mediaDevices.enumerateDevices();
+
+    const cameras =
+      devices.filter(
+        (device) => device.kind === "videoinput"
+      );
+
+    console.log("[360 Source] Available cameras:");
+
+    cameras.forEach((camera, index) => {
+      console.log(`[360 Source] Camera ${index + 1}:`, {
+        label: camera.label,
+        deviceId: camera.deviceId,
+      });
+    });
+
+    for (const camera of cameras) {
+      try {
+        const testStream =
+          await navigator.mediaDevices.getUserMedia({
+            video: {
+              deviceId: {
+                exact: camera.deviceId,
+              },
+            },
+            audio: false,
+          });
+
+        const track =
+          testStream.getVideoTracks()[0];
+
+        const settings =
+          track.getSettings();
+
+        console.log(
+          "[360 Source] Camera test:",
+          {
+            label: camera.label,
+            width: settings.width,
+            height: settings.height,
+            frameRate: settings.frameRate,
+            aspectRatio:
+              settings.width && settings.height
+                ? settings.width / settings.height
+                : null,
+          }
+        );
+
+        const aspectRatio =
+          settings.width && settings.height
+            ? settings.width / settings.height
+            : 0;
+
+        if (
+          Math.abs(aspectRatio - 2) <= 0.05
+        ) {
+          console.log(
+            "[360 Source] Genuine 2:1 source found:",
+            camera.label
+          );
+
+          return testStream;
+        }
+
+        track.stop();
+      } catch (error) {
+        console.warn(
+          "[360 Source] Camera test failed:",
+          camera.label,
+          error
+        );
+      }
+    }
+
+    throw new Error(
+      "[360 Source] No camera providing a genuine 2:1 equirectangular stream was found."
+    );
+  };
+
+  /* ══════════════════════════════════════════════════════
+       setupWebRTC — ALL SIGNALING LOGIC PRESERVED
+       QUALITY UPGRADES MARKED WITH [QUALITY]
+    ══════════════════════════════════════════════════════ */
+  const setupWebRTC = async () => {
+    /* [QUALITY] Capture targets 720p while allowing the browser to avoid
+           expensive unsupported modes on mobile cameras. */
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: getVideoConstraints(cameraFacing),
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: Q.AUDIO_CHANNELS,
+        sampleRate: Q.AUDIO_SAMPLE_RATE,
+        sampleSize: 16,
+        /* [QUALITY] Latency hint — low latency mode for real-time */
+        latency: 0,
+        googEchoCancellation: true,
+        googAutoGainControl: false,
+        googNoiseSuppression: false,
+        googHighpassFilter: false,
+      },
+    });
+
+    const cameraStream = stream;
+
+    equirectSynthRef.current =
+      new EquirectangularSynthesizer({
+        width: 2048,
+        height: 1024,
+        fps: 30,
+      });
+
+    const streamForWebRTC =
+      await equirectSynthRef.current.start(
+        cameraStream
+      );
+
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject =
+        streamForWebRTC;
+    }
+
+    browserControllerRef.current = new BrowserController({
+      intent:
+        selectedIntent === "Talk"
+          ? "talk"
+          : selectedIntent === "Experience"
+            ? "experience"
+            : selectedIntent === "Learn"
+              ? "learn"
+              : "scenery",
+    });
+
+    const captureDiagnostics = browserControllerRef.current.applyToStream(
+      stream,
+      browserControllerRef.current.intent,
+    );
+
+    console.log("[BrowserController] Capture:", captureDiagnostics);
+
+    /* ORIGINAL mic level analyser (unchanged) */
+    if (!window.AudioContext && !window.webkitAudioContext) {
+      console.log("AudioContext unsupported");
+    }
+    const audioContext = new (
+      window.AudioContext || window.webkitAudioContext
+    )();
+    audioContext.suspend();
+    const analyser = audioContext.createAnalyser();
+    const microphone = audioContext.createMediaStreamSource(stream);
+    microphone.connect(analyser);
+    analyser.fftSize = 256;
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    const checkMicLevel = () => {
+      analyser.getByteFrequencyData(dataArray);
+      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+      setMicLevel(avg);
+      if (!document.hidden) requestAnimationFrame(checkMicLevel);
+    };
+    audioContext.resume();
+    checkMicLevel();
+
+    const turnResponse = await fetch(
+      "https://liveatlas-cp.onrender.com/api/turn-credentials/",
+    );
+
+    if (!turnResponse.ok) {
+      throw new Error(
+        `Failed to fetch Cloudflare TURN credentials: ${turnResponse.status}`,
+      );
+    }
+
+    const turnConfig = await turnResponse.json();
+
+    if (
+      !turnConfig.iceServers ||
+      !Array.isArray(turnConfig.iceServers) ||
+      turnConfig.iceServers.length === 0
+    ) {
+      throw new Error("Cloudflare TURN response contains no ICE servers");
+    }
+
+    console.log("[TURN] Cloudflare ICE servers loaded");
+
+    peerConnection.current = new RTCPeerConnection({
+      iceServers: turnConfig.iceServers,
+      iceCandidatePoolSize: 10,
+      bundlePolicy: "max-bundle",
+      rtcpMuxPolicy: "require",
+      encodedInsertableStreams: false,
+    });
+
+    peerConnection.current.oniceconnectionstatechange = async () => {
+      const pc = peerConnection.current;
+
+      if (!pc) return;
+
+      const state = pc.iceConnectionState;
+
+      try {
+        const stats = await pc.getStats();
+
+        const candidates = new Map();
+        const candidatePairs = [];
+
+        stats.forEach((report) => {
+          if (
+            report.type === "local-candidate" ||
+            report.type === "remote-candidate"
+          ) {
+            candidates.set(report.id, report);
+          }
+        });
+
+        stats.forEach((report) => {
+          if (
+            report.type === "candidate-pair" &&
+            report.state === "succeeded"
+          ) {
+            const local = candidates.get(report.localCandidateId);
+            const remote = candidates.get(report.remoteCandidateId);
+
+            candidatePairs.push({
+
+              id: report.id,
+
+              nominated: report.nominated === true,
+
+              priority: report.priority,
+
+              localType: local?.candidateType,
+
+              localProtocol: local?.protocol,
+
+              remoteType: remote?.candidateType,
+
+              remoteProtocol: remote?.protocol,
+
+              rtt: report.currentRoundTripTime,
+
+              availableOutgoingBitrate:
+                report.availableOutgoingBitrate,
+
+              bytesSent: report.bytesSent,
+
+              bytesReceived: report.bytesReceived,
+
+            });
+          }
+        });
+
+        const transportReport = [...stats.values()].find(
+          (report) => report.type === "transport",
+        );
+
+        const selectedPairId = transportReport?.selectedCandidatePairId;
+
+        const nominatedPair =
+          candidatePairs.find(
+            (pair) => pair.id === selectedPairId,
+          ) || candidatePairs[0];
+
+        if (nominatedPair) {
+          const usesRelay =
+            nominatedPair.localType === "relay" ||
+            nominatedPair.remoteType === "relay";
+
+          const usesDirectPath =
+            nominatedPair.localType === "host" ||
+            nominatedPair.localType === "srflx" ||
+            nominatedPair.localType === "prflx" ||
+            nominatedPair.remoteType === "host" ||
+            nominatedPair.remoteType === "srflx" ||
+            nominatedPair.remoteType === "prflx";
+
+          console.log("[ICE SELECTED PATH]", {
+            state,
+            transport: usesRelay ? "TURN_RELAY" : "P2P_DIRECT",
+            localType: nominatedPair.localType,
+            localProtocol: nominatedPair.localProtocol,
+            remoteType: nominatedPair.remoteType,
+            remoteProtocol: nominatedPair.remoteProtocol,
+            priority: nominatedPair.priority,
+            rtt: nominatedPair.rtt,
+            availableOutgoingBitrate:
+              nominatedPair.availableOutgoingBitrate,
+          });
+
+          console.log("[ICE CANDIDATE PAIRS]", candidatePairs);
+        }
+      } catch (error) {
+        console.error("[ICE STATS] Failed to inspect candidate pairs:", error);
+      }
+
+      if (state === "connected" || state === "completed") {
+        setConnectionQuality("good");
+        badNetworkSinceRef.current = null;
+
+        if (iceRestartTimerRef.current) {
+          clearTimeout(iceRestartTimerRef.current);
+          iceRestartTimerRef.current = null;
+        }
+      }
+
+      if (state === "disconnected" || state === "failed") {
+        setConnectionQuality("poor");
+        console.warn("WebRTC connection unstable:", state);
+
+        if (iceRestartTimerRef.current) {
+          return;
+        }
+
+        console.warn("Waiting before ICE restart...");
+
+        iceRestartTimerRef.current = setTimeout(async () => {
+          iceRestartTimerRef.current = null;
+
+          const currentPc = peerConnection.current;
+
+          if (
+            currentPc &&
+            (currentPc.iceConnectionState === "disconnected" ||
+              currentPc.iceConnectionState === "failed") &&
+            currentPc.restartIce &&
+            ws.current &&
+            ws.current.readyState === WebSocket.OPEN
+          ) {
+            console.log("Restarting ICE...");
+
+            try {
+              currentPc.restartIce();
+
+              if (currentPc.signalingState !== "stable") {
+                console.warn(
+                  "ICE restart prepared, waiting for stable signaling state.",
+                );
+                return;
+              }
+
+              const restartOffer = await currentPc.createOffer({
+                iceRestart: true,
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true,
+              });
+
+              await currentPc.setLocalDescription(restartOffer);
+
+              ws.current.send(
+                JSON.stringify({
+                  type: "offer",
+                  offer: restartOffer,
+                }),
+              );
+
+              console.log("ICE restart offer sent.");
+            } catch (error) {
+              console.error("ICE restart failed:", error);
+            }
+          } else {
+            console.log(
+              "ICE restart skipped - connection or signaling not ready",
+            );
+          }
+        }, 3000);
+      }
+
+      if (state === "closed") {
+        console.log("ICE connection closed");
+      }
+    };
+
+    /* ORIGINAL track hints (unchanged) */
+    streamForWebRTC.getTracks().forEach((track) => {
+      if (track.kind === "video" && !track.contentHint)
+        track.contentHint = "detail";
+      if (track.kind === "audio") track.contentHint = "speech";
+      const existingSender = peerConnection.current
+        .getSenders()
+        .find((s) => s.track?.kind === track.kind);
+      if (!existingSender) {
+        peerConnection.current.addTrack(
+          track,
+          streamForWebRTC
+        );
+      }
+    });
+
+    networkEngineRef.current = new NetworkEngine(peerConnection.current, {
+      applyStartupEncoderPreference: true,
+      engineVersion: "BROWSER_COOPERATIVE_PRESENTATION",
+      encoder: {
+        maxBitrate: 3800000,
+        maxFramerate: 30,
+        scaleResolutionDownBy: 1,
+        degradationPreference: "maintain-resolution",
+      },
+    });
+
+    await networkEngineRef.current.start();
+
+    communicationStatusTimerRef.current = setInterval(async () => {
+      if (!networkEngineRef.current || !peerConnection.current) return;
+
+      const diagnostics = networkEngineRef.current.getDiagnostics();
+
+
+
+      const guardian = networkEngineRef.current.connectionGuardian;
+      const telemetry = networkEngineRef.current.telemetry.getStats();
+
+      const browserReview =
+        browserControllerRef.current?.reviewTelemetry(telemetry);
+
+      if (browserReview?.recommendation?.action === "ENCODER_STUCK_LOW") {
+        console.log(
+          "[BrowserController]",
+          browserReview.recommendation.reason,
+        );
+      }
+
+      const profileName =
+        networkEngineRef.current.getCurrentProfileName?.() ||
+        diagnostics.profile ||
+        "HIGH";
+
+      setCommunicationStatus({
+        connected: guardian.isConnected(),
+
+        quality:
+          profileName === "HIGH"
+            ? "Excellent"
+            : profileName === "MEDIUM"
+              ? "Good"
+              : "Basic",
+
+        latency: telemetry?.rtt
+          ? Math.round(telemetry.rtt * 1000)
+          : "--",
+
+        jitterBufferDelay:
+          telemetry?.reception?.averageJitterBufferDelay || 0,
+
+        video: profileName === "HIGH" ? "HD" : "SD",
+
+        actualBitrate: telemetry?.actualBitrate || 0,
+
+        availableBitrate: telemetry?.availableBitrate || 0,
+
+        captureWidth: telemetry?.captureWidth || 0,
+
+        captureHeight: telemetry?.captureHeight || 0,
+
+        encodedWidth:
+          telemetry?.encodedWidth ||
+          telemetry?.encodedFrameWidth ||
+          0,
+
+        encodedHeight:
+          telemetry?.encodedHeight ||
+          telemetry?.encodedFrameHeight ||
+          0,
+
+        receivedWidth:
+          telemetry?.receivedWidth ||
+          telemetry?.receivedFrameWidth ||
+          0,
+
+        receivedHeight:
+          telemetry?.receivedHeight ||
+          telemetry?.receivedFrameHeight ||
+          0,
+      });
+
+      const rttSeconds = Number(
+        telemetry?.transmission?.rtt ??
+        telemetry?.rtt ??
+        0
+      );
+
+      const rttMs = rttSeconds * 1000;
+
+      const jitterSeconds = Number(
+        telemetry?.transmission?.jitter ??
+        telemetry?.reception?.jitter ??
+        telemetry?.jitter ??
+        0
+      );
+
+      const jitterMs = jitterSeconds * 1000;
+
+      const severeNetworkCondition =
+        rttMs >= 400 ||
+        jitterMs >= 200;
+
+      console.log("[NETWORK QUALITY]", {
+        rttMs: Math.round(rttMs),
+        jitterMs: Math.round(jitterMs),
+        packetLoss: telemetry?.packetLoss ?? 0,
+        actualBitrateKbps: Math.round(
+          Number(telemetry?.actualBitrate || 0) / 1000
+        ),
+        availableBitrateKbps: Math.round(
+          Number(telemetry?.availableBitrate || 0) / 1000
+        ),
+        encodedResolution:
+          `${telemetry?.encodedWidth || 0}x${telemetry?.encodedHeight || 0}`,
+        receivedResolution:
+          `${telemetry?.receivedWidth || 0}x${telemetry?.receivedHeight || 0}`,
+        encodedFps: telemetry?.encoding?.fps || 0,
+
+        targetBitrateKbps: Math.round(
+          Number(telemetry?.encoding?.targetBitrate || 0) / 1000
+        ),
+
+        qualityLimitation:
+          telemetry?.encoding?.qualityLimitation || "none",
+
+        encoderImplementation:
+          telemetry?.encoding?.encoderImplementation || "unknown",
+
+        encodedWidth:
+          telemetry?.encoding?.width || 0,
+
+        encodedHeight:
+          telemetry?.encoding?.height || 0,
+
+        receivedFps: telemetry?.reception?.fps || 0,
+        framesDropped: telemetry?.reception?.framesDropped || 0,
+        iceState: peerConnection.current?.iceConnectionState,
+        localCandidate:
+          telemetry?.transmission?.localCandidateType || "unknown",
+        remoteCandidate:
+          telemetry?.transmission?.remoteCandidateType || "unknown",
+      });
+
+      const pc = peerConnection.current;
+
+      if (
+        pc.iceConnectionState === "disconnected" ||
+        pc.iceConnectionState === "failed"
+      ) {
+        if (!badNetworkSinceRef.current) {
+          badNetworkSinceRef.current = Date.now();
+
+          console.warn(
+            "[ICE RECOVERY] Severe network degradation detected",
+            {
+              rttMs: Math.round(rttMs),
+              jitterMs: Math.round(jitterMs),
+            },
+          );
+        }
+
+        const badNetworkDuration =
+          Date.now() - badNetworkSinceRef.current;
+
+        const restartCooldown =
+          Date.now() - lastAutomaticIceRestartRef.current;
+
+        if (
+          badNetworkDuration >= 5000 &&
+          restartCooldown >= 30000 &&
+          !iceRestartTimerRef.current &&
+          ws.current?.readyState === WebSocket.OPEN &&
+          pc.signalingState === "stable"
+        ) {
+          lastAutomaticIceRestartRef.current = Date.now();
+
+          console.warn(
+            "[ICE RECOVERY] Sustained severe network degradation. Restarting ICE.",
+            {
+              rttMs: Math.round(rttMs),
+              jitterMs: Math.round(jitterMs),
+            },
+          );
+
+          try {
+            pc.restartIce();
+
+            const restartOffer = await pc.createOffer({
+              iceRestart: true,
+              offerToReceiveAudio: true,
+              offerToReceiveVideo: true,
+            });
+
+            await pc.setLocalDescription(restartOffer);
+
+            ws.current.send(
+              JSON.stringify({
+                type: "offer",
+                offer: restartOffer,
+              }),
+            );
+
+            console.log(
+              "[ICE RECOVERY] Automatic ICE restart offer sent.",
+            );
+          } catch (error) {
+            console.error(
+              "[ICE RECOVERY] Automatic ICE restart failed:",
+              error,
+            );
+          }
+        }
+      } else {
+        if (badNetworkSinceRef.current) {
+          console.log(
+            "[ICE RECOVERY] Network recovered before ICE restart.",
+          );
+        }
+
+        badNetworkSinceRef.current = null;
+      }
+    }, 1000);
+
+    window.liveAtlasNetwork = networkEngineRef.current;
+
+
+
+    /* ORIGINAL ontrack — with quality playback hints added */
+    peerConnection.current.ontrack = (event) => {
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = event.streams[0];
+
+        if (isImmersiveVR && spatialRendererRef.current) {
+          spatialRendererRef.current.setVideoSource(remoteVideoRef.current);
+
+          console.log(
+            "[Spatial] Remote video connected directly to WebXR renderer",
+          );
+        }
+
+        /* [QUALITY] Force real-time playback — no buffering delay */
+        remoteVideoRef.current.playbackRate = 1.0;
+        remoteVideoRef.current.preservesPitch = false;
+
+        remoteVideoRef.current.disablePictureInPicture = true;
+
+        event.streams[0].getVideoTracks()[0].onended = () => {
+          console.log("Remote video track ended");
+          setConnectionQuality("poor");
+          setIsReconnecting(true);
+        };
+        remoteVideoRef.current
+          .play()
+          .catch((err) => console.log("Autoplay blocked:", err));
+      }
+    };
+
+
+    /* ORIGINAL ICE candidate handler (unchanged) */
+    peerConnection.current.onicecandidate = (event) => {
+      if (event.candidate) {
+        ws.current.send(
+          JSON.stringify({
+            type: "candidate",
+            candidate: event.candidate,
+          }),
+        );
+      }
+    };
+
+    /* ORIGINAL offer creation — with codec priority injected into SDP */
+    if (peerConnection.current.signalingState === "stable") {
+      const offer = await peerConnection.current.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true,
+      });
+
+      const optimizedSDP = preferHighQualityCodecs(offer.sdp, "video");
+      const optimizedOffer = {
+        type: offer.type,
+        sdp: optimizedSDP,
+      };
+
+      await peerConnection.current.setLocalDescription(optimizedOffer);
+
+      inspectWebRTCFeedback(
+        peerConnection.current.localDescription?.sdp,
+        "LOCAL OFFER",
+      );
+
+      ws.current.send(
+        JSON.stringify({
+          type: "offer",
+          offer: optimizedOffer,
+        }),
+      );
+
+      console.log("Initial offer sent (H264-preferred)");
+    }
+  };
+
+
+  /* ── ORIGINAL handleSignalMessage (changed) ── */
+  const handleSignalMessage = async (data) => {
+    console.log("Signal received:", data.type);
+
+    if (!peerConnection.current) return;
+
+    const pc = peerConnection.current;
+
+    const flushPendingIceCandidates = async () => {
+      if (
+        !pc.remoteDescription ||
+        pendingIceCandidatesRef.current.length === 0
+      ) {
+        return;
+      }
+
+      const pendingCandidates =
+        pendingIceCandidatesRef.current.splice(0);
+
+      for (const candidate of pendingCandidates) {
+        try {
+          await pc.addIceCandidate(
+            new RTCIceCandidate(candidate)
+          );
+        } catch (error) {
+          console.error("Queued ICE error:", error);
+        }
+      }
+    };
+
+    if (data.type === "offer") {
+      await pc.setRemoteDescription(
+        new RTCSessionDescription(data.offer)
+      );
+
+      await flushPendingIceCandidates();
+
+      const answer = await pc.createAnswer();
+
+      await pc.setLocalDescription(answer);
+
+      if (ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(
+          JSON.stringify({
+            type: "answer",
+            answer,
+          })
+        );
+      }
+    } else if (data.type === "answer") {
+      await pc.setRemoteDescription(
+        new RTCSessionDescription(data.answer)
+      );
+
+      inspectWebRTCFeedback(
+        pc.remoteDescription?.sdp,
+        "REMOTE ANSWER",
+      );
+
+      await flushPendingIceCandidates();
+    }
+    else if (data.type === "candidate") {
+      if (
+        data.candidate === null ||
+        data.candidate === undefined
+      ) {
+        return;
+      }
+
+      if (!pc.remoteDescription) {
+        pendingIceCandidatesRef.current.push(data.candidate);
+
+        console.log(
+          "Queued ICE candidate until remoteDescription is set."
+        );
+
+        return;
+      }
+
+      try {
+        await pc.addIceCandidate(
+          new RTCIceCandidate(data.candidate)
+        );
+      } catch (error) {
+        console.error("ICE error:", error);
+      }
+    }
+  };
+
+  /* ── ORIGINAL toggles (unchanged) ── */
+  const toggleAudio = () => {
+    const stream = localVideoRef.current?.srcObject;
+    if (!stream) return;
+    const track = stream.getAudioTracks()[0];
+    track.enabled = !track.enabled;
+    setIsAudioOn(track.enabled);
+  };
+
+  const toggleVideo = () => {
+    const stream = localVideoRef.current?.srcObject;
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    track.enabled = !track.enabled;
+    setIsVideoOn(track.enabled);
+  };
+
+  /* ── ORIGINAL endCall (unchanged) ── */
+  const endCall = async () => {
+    const dbId = roomID.split("_")[1];
+    try {
+      await fetch(`https://liveatlas-cp.onrender.com/api/end-tour/${dbId}/`, {
+        method: "POST",
+      });
+    } catch (err) {
+      console.error(err);
+    }
+    if (localVideoRef.current?.srcObject) {
+      localVideoRef.current.srcObject
+        .getTracks()
+        .forEach((track) => track.stop());
+    }
+    if (ws.current) ws.current.close();
+    disposeVR();
+    stopImmersiveVR();
+    navigate("/");
+  };
+
+  /* ── ORIGINAL toggleFullScreen (unchanged) ── */
+  const toggleFullScreen = async () => {
+    if (!document.fullscreenElement) {
+      const element = document.querySelector(".room-container");
+      if (element.requestFullscreen) await element.requestFullscreen();
+      setIsFullScreen(true);
+    } else {
+      if (document.exitFullscreen) await document.exitFullscreen();
+      setIsFullScreen(false);
+    }
+  };
+
+  /* ── ORIGINAL toggleVRMode (unchanged) ── */
+  const toggleVRMode = () => {
+    const next = !isImmersiveVR;
+
+    console.log(
+      "[Spatial] 360 VR TOGGLED:",
+      next
+    );
+
+    setIsVRMode(false);
+    setIsImmersiveVR(next);
+  };
+
+  /* ── ORIGINAL handleAskAI (unchanged) ── */
+  const handleAskAI = async () => {
+    if (!aiQuestion || aiLoading) return;
+    setAILoading(true);
+    try {
+      const answer = await askAI(aiQuestion);
+      setAIAnswer(answer);
+    } catch (err) {
+      console.error(err);
+      setAIAnswer("AI error occurred");
+    }
+    setAILoading(false);
+  };
+
+  /* ── ORIGINAL JSX (100% unchanged) ── */
+  return (
+    <div
+      className={`room-container ${isFullScreen ? "fullscreen-mode" : ""}`}
+      onClick={() => {
+        if (isFullScreen) setShowControls(true);
+      }}
+      style={{ position: "relative" }}
+    >
+      {guideLocation && (
+        <div
+          style={{
+            position: "absolute",
+            top: "80px",
+            left: "20px",
+            background: "rgba(0,0,0,0.6)",
+            padding: "8px",
+            borderRadius: "6px",
+            color: "white",
+            fontSize: "12px",
+            zIndex: 10,
+          }}
+        >
+          📍{" "}
+          {placeName
+            ? placeName
+            : `${guideLocation.lat.toFixed(4)}, ${guideLocation.lon.toFixed(4)}`}
+        </div>
+      )}
+
+      {isReconnecting && (
+        <div className="reconnect-banner">Reconnecting...</div>
+      )}
+
+      <CommunicationStatus
+        visible={!isFullScreen && !isVRMode && !isImmersiveVR}
+
+        connected={communicationStatus.connected}
+        quality={communicationStatus.quality}
+        latency={communicationStatus.latency}
+        jitterBufferDelay={communicationStatus.jitterBufferDelay}
+        video={communicationStatus.video}
+
+        actualBitrate={communicationStatus.actualBitrate}
+        availableBitrate={communicationStatus.availableBitrate}
+
+        captureWidth={communicationStatus.captureWidth}
+        captureHeight={communicationStatus.captureHeight}
+
+        encodedWidth={communicationStatus.encodedWidth}
+        encodedHeight={communicationStatus.encodedHeight}
+
+        receivedWidth={communicationStatus.receivedWidth}
+        receivedHeight={communicationStatus.receivedHeight}
+      />
+
+      {!isFullScreen && (
+        <div className="room-header">
+          <FaGlobeAmericas size={28} color="#0EA5E9" />
+          <span className="brand-text">
+            Live<span style={{ color: "#0EA5E9" }}>Atlas</span>
+          </span>
+        </div>
+      )}
+
+      <div
+        className="video-grid"
+        style={{
+          opacity: isVRMode || isImmersiveVR ? 0 : 1,
+          pointerEvents: isVRMode || isImmersiveVR ? "none" : "auto",
+          position: "relative",
+          zIndex: 1,
+        }}
+      >
+        {showLocalVideo && !isFullScreen && (
+          <div className="video-wrapper local">
+            <video ref={localVideoRef} autoPlay playsInline muted />
+            <div className="name-tag">You</div>
+          </div>
+        )}
+
+        <div className="video-wrapper remote">
+          <video
+            ref={remoteVideoRef}
+            autoPlay
+            playsInline
+            onWaiting={() => setIsReconnecting(true)}
+            onPlaying={() => setIsReconnecting(false)}
+          />
+          <div className="name-tag">Live Feed</div>
+          <div
+            style={{
+              position: "absolute",
+              top: "10px",
+              right: "10px",
+              background: connectionQuality === "good" ? "green" : "red",
+              color: "white",
+              padding: "4px 8px",
+              borderRadius: "6px",
+              fontSize: "12px",
+            }}
+          >
+            {connectionQuality}
+          </div>
+        </div>
+      </div>
+
+      {(isVRMode || isImmersiveVR) && (
+        <div
+          ref={vrContainerRef}
+          style={{
+            position: "absolute",
+            inset: 0,
+            backgroundColor: "black",
+            zIndex: 0,
+          }}
+        />
+      )}
+
+      <div
+        style={{
+          position: "absolute",
+          right: "20px",
+          bottom: "120px",
+          zIndex: 9999,
+          background: "rgba(0,0,0,0.7)",
+          padding: "10px",
+          borderRadius: "8px",
+          color: "white",
+          width: "260px",
+        }}
+      >
+        <input
+          type="text"
+          placeholder="Ask AI about this place..."
+          value={aiQuestion}
+          onChange={(e) => setAIQuestion(e.target.value)}
+          style={{ width: "100%", padding: "6px" }}
+        />
+        <button
+          onClick={handleAskAI}
+          style={{ marginTop: "6px", width: "100%" }}
+        >
+          Ask
+        </button>
+        {aiLoading && <p>Thinking...</p>}
+        {aiAnswer && <p style={{ marginTop: "8px" }}>{aiAnswer}</p>}
+      </div>
+
+      {!isFullScreen && (
+        <div
+          style={{
+            position: "absolute",
+            top: "120px",
+            right: "20px",
+            zIndex: 1000,
+            background: "rgba(0,0,0,0.7)",
+            padding: "10px",
+            borderRadius: "8px",
+            color: "white",
+          }}
+        >
+          <p>Change Intent</p>
+          <select
+            value={selectedIntent}
+            onChange={async (e) => {
+              const newIntent = e.target.value;
+              setSelectedIntent(newIntent);
+              await supabase
+                .from("session_intents")
+                .delete()
+                .eq("room_id", roomID);
+              const { error } = await supabase
+                .from("session_intents")
+                .insert([{ room_id: roomID, intent: newIntent }]);
+              console.log("Intent Updated:", newIntent, error);
+            }}
+            style={{ width: "100%", padding: "5px" }}
+          >
+            <option value="Explore">Explore</option>
+            <option value="Talk">Talk</option>
+            <option value="Learn">Learn</option>
+            <option value="Experience">Experience</option>
+          </select>
+        </div>
+      )}
+
+      <div
+        className={`controls-bar ${isFullScreen && !showControls ? "controls-hidden" : ""}`}
+      >
+        {!isFullScreen && (
+          <>
+            <button onClick={toggleAudio}>
+              {isAudioOn ? <FaMicrophone /> : <FaMicrophoneSlash />}
+            </button>
+            <button onClick={toggleVideo}>
+              {isVideoOn ? <FaVideo /> : <FaVideoSlash />}
+            </button>
+            <button onClick={() => setShowLocalVideo((prev) => !prev)}>
+              {showLocalVideo ? "Hide Cam" : "Show Cam"}
+            </button>
+            <button onClick={endCall}>
+              <FaPhoneSlash />
+            </button>
+            <button onClick={switchCamera}>
+              <FaSyncAlt />
+            </button>
+            <button onClick={toggleVRMode}>
+              {isImmersiveVR ? "Exit VR" : "VR"}
+            </button>
+
+
+          </>
+        )}
+        <button onClick={toggleFullScreen}>
+          {isFullScreen ? <FaCompress /> : <FaExpand />}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+export default VideoRoom;

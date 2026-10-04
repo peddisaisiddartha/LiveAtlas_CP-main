@@ -1,0 +1,45 @@
+.communication-status {
+    position: absolute;
+
+    top: 70px;
+    left: 50%;
+    transform: translateX(-50%);
+
+    display: flex;
+    align-items: center;
+    gap: 18px;
+
+    padding: 8px 18px;
+
+    border-radius: 999px;
+
+    background: rgba(18, 24, 39, 0.82);
+    backdrop-filter: blur(12px);
+
+    color: #fff;
+
+    font-size: 13px;
+    font-weight: 500;
+
+    z-index: 999;
+
+    box-shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+
+.communication-status span{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    white-space:nowrap;
+}
+
+.dot{
+    width:10px;
+    height:10px;
+    border-radius:50%;
+    background:#9ca3af;
+}
+
+.dot.connected{
+    background:#22c55e;
+}

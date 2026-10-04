@@ -1,0 +1,141 @@
+export default class EquirectangularSynthesizer {
+    constructor({
+        width = 0,
+        height = 0,
+        fps = 30,
+    } = {}) {
+        this.width = width;
+        this.height = height;
+        this.fps = fps;
+
+        this.sourceStream = null;
+        this.outputStream = null;
+    }
+
+    async start(sourceStream) {
+        if (!sourceStream) {
+            throw new Error(
+                "[360 Source] Source stream missing"
+            );
+        }
+
+        const videoTracks =
+            sourceStream.getVideoTracks();
+
+        if (videoTracks.length === 0) {
+            throw new Error(
+                "[360 Source] No video track available"
+            );
+        }
+
+        const videoTrack =
+            videoTracks[0];
+
+        const settings =
+            videoTrack.getSettings();
+
+        const width =
+            settings.width || 0;
+
+        const height =
+            settings.height || 0;
+
+        console.log(
+            "[360 Source] Input video settings:",
+            settings
+        );
+
+        if (!width || !height) {
+            throw new Error(
+                "[360 Source] Video dimensions unavailable"
+            );
+        }
+
+        const aspectRatio =
+            width / height;
+
+        console.log(
+            "[360 Source] Input aspect ratio:",
+            aspectRatio
+        );
+
+        /*
+         * A standard equirectangular 360° frame
+         * has a 2:1 aspect ratio.
+         */
+        const tolerance = 0.05;
+
+        if (
+            Math.abs(
+                aspectRatio - 2
+            ) > tolerance
+        ) {
+            throw new Error(
+                `[360 Source] Input is not equirectangular 2:1. Received ${width}x${height}`
+            );
+        }
+
+        this.width = width;
+        this.height = height;
+        this.fps =
+            settings.frameRate ||
+            this.fps;
+
+        /*
+         * No canvas transformation.
+         * No repetition.
+         * No mirroring.
+         *
+         * The incoming stream is already the
+         * equirectangular 360° source.
+         */
+        this.sourceStream =
+            sourceStream;
+
+        this.outputStream =
+            new MediaStream();
+
+        videoTracks.forEach((track) => {
+            this.outputStream.addTrack(track);
+        });
+
+        sourceStream
+            .getAudioTracks()
+            .forEach((track) => {
+                this.outputStream.addTrack(track);
+            });
+
+        console.log(
+            "[360 Source] Genuine equirectangular source accepted:",
+            {
+                width: this.width,
+                height: this.height,
+                fps: this.fps,
+                aspectRatio,
+            }
+        );
+
+        return this.outputStream;
+    }
+
+    getVideoTrack() {
+        return (
+            this.outputStream
+                ?.getVideoTracks()[0] ||
+            null
+        );
+    }
+
+    stop() {
+        if (this.outputStream) {
+            this.outputStream
+                .getTracks()
+                .forEach((track) => {
+                    track.stop();
+                });
+        }
+
+        this.outputStream = null;
+        this.sourceStream = null;
+    }
+}
